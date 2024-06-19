@@ -863,23 +863,69 @@ static int dediprog_check_devicestring(struct dediprog_data *dp_data)
  * much different.
  * @return  the id on success, -1 on failure
  */
-static int dediprog_read_id(libusb_device_handle *dediprog_handle)
+static int dediprog_read_id(const struct dediprog_data *dp_data)
 {
 	int ret;
-	uint8_t buf[3];
-
-	ret = libusb_control_transfer(dediprog_handle, REQTYPE_OTHER_IN,
-				      0x7,    /* request */
-				      0,      /* value */
-				      0xEF00, /* index */
-				      buf, sizeof(buf),
-				      DEFAULT_TIMEOUT);
-	if (ret != sizeof(buf)) {
-		msg_perr("Failed to read dediprog id, error %d!\n", ret);
+	if (dp_data->devicetype == DEV_UNKNOWN) {
+		msg_perr("Cannot read dediprog ID until we know the device type\n");
 		return -1;
 	}
 
-	return buf[0] << 16 | buf[1] << 8 | buf[2];
+	if (dp_data->devicetype == DEV_SF600PG2) {
+		unsigned char vBuffer[6];
+
+		vBuffer[0]=0;
+		vBuffer[1]=0;
+		vBuffer[2]=0;
+		vBuffer[3]=2;
+		vBuffer[4]=0;
+		vBuffer[5]=0;
+
+		//must read twice
+		ret = libusb_control_transfer(dp_data->handle, REQTYPE_EP_OUT, 0x71, 0 /*value*/, 0, vBuffer, sizeof(vBuffer), DEFAULT_TIMEOUT);
+		if (ret != sizeof(vBuffer)) {
+			msg_perr("Error: %s\n", libusb_strerror(ret));
+			return -1;
+		}
+		//first
+		unsigned char vBufferSN[512];
+		int transferred = 512;
+		ret = libusb_bulk_transfer(dp_data->handle, 2 | LIBUSB_ENDPOINT_IN, vBufferSN, sizeof(vBufferSN), &transferred, DEFAULT_TIMEOUT);
+		if (ret != 0) {
+			msg_perr("Error: %s\n", libusb_strerror(ret));
+			return -1;
+		}
+
+		ret = libusb_control_transfer(dp_data->handle, REQTYPE_EP_OUT, 0x71, 0 /*value*/, 0, vBuffer, sizeof(vBuffer), DEFAULT_TIMEOUT);
+		if (ret != sizeof(vBuffer)) {
+			msg_perr("Error: %s\n", libusb_strerror(ret));
+			return -1;
+		}
+		//second
+		ret = libusb_bulk_transfer(dp_data->handle, 2 | LIBUSB_ENDPOINT_IN, vBufferSN, sizeof(vBufferSN), &transferred, DEFAULT_TIMEOUT);
+		if (ret != 0) {
+			msg_perr("Error: %s\n", libusb_strerror(ret));
+			return -1;
+		}
+
+		return vBufferSN[2] << 16 | vBufferSN[1] << 8 | vBufferSN[0];
+	}
+	else {
+		uint8_t buf[3];
+
+		ret = libusb_control_transfer(dp_data->handle, REQTYPE_OTHER_IN,
+						0x7,    /* request */
+						0,      /* value */
+						0xEF00, /* index */
+						buf, sizeof(buf),
+						DEFAULT_TIMEOUT);
+		if (ret != sizeof(buf)) {
+			msg_perr("Failed to read dediprog id, error %d!\n", ret);
+			return -1;
+		}
+
+		return buf[0] << 16 | buf[1] << 8 | buf[2];
+	}
 }
 
 /*
@@ -1239,6 +1285,15 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 				continue;
 			}
 
+			/* Try reading the devicestring. If that fails and the device is old (FW < 6.0.0, which we can not know)
+			* then we need to try the "set voltage" command and then attempt to read the devicestring again. */
+			if (dediprog_check_devicestring(dp_data)) {
+				if (dediprog_set_voltage(dp_data->handle))
+					goto search_err_cleanup_continue;
+				if (dediprog_check_devicestring(dp_data))
+					goto search_err_cleanup_continue;
+			}
+
 			/* Notice we can only call dediprog_read_id() after
 			 * libusb_set_configuration() and
 			 * libusb_claim_interface(). When searching by id and
@@ -1246,39 +1301,41 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 			 * device is in use by another instance of flashrom),
 			 * the device is skipped and the next device is tried.
 			 */
-			found_id = dediprog_read_id(dp_data->handle);
+			found_id = dediprog_read_id(dp_data);
 			if (found_id < 0) {
 				msg_perr("Could not read id.\n");
-				libusb_release_interface(dp_data->handle, 0);
-				libusb_close(dp_data->handle);
-				continue;
+				goto search_err_cleanup_continue;
 			}
-			msg_pinfo("Found dediprog id SF%06d.\n", found_id);
+			msg_pinfo("Found dediprog id %06d.\n", found_id);
 			if (found_id != id) {
-				libusb_release_interface(dp_data->handle, 0);
-				libusb_close(dp_data->handle);
-				continue;
+				goto search_err_cleanup_continue;
 			}
 			break;
+
+search_err_cleanup_continue:
+			libusb_release_interface(dp_data->handle, 0);
+			libusb_close(dp_data->handle);
+			continue;
 		}
 	} else {
 		if (dediprog_open(usedevice, dp_data)) {
 			goto init_err_exit;
 		}
-		found_id = dediprog_read_id(dp_data->handle);
+
+		/* Try reading the devicestring. If that fails and the device is old (FW < 6.0.0, which we can not know)
+		* then we need to try the "set voltage" command and then attempt to read the devicestring again. */
+		if (dediprog_check_devicestring(dp_data)) {
+			if (dediprog_set_voltage(dp_data->handle))
+				goto init_err_cleanup_exit;
+			if (dediprog_check_devicestring(dp_data))
+				goto init_err_cleanup_exit;
+		}
+
+		found_id = dediprog_read_id(dp_data);
 	}
 
 	if (found_id >= 0) {
-		msg_pinfo("Using dediprog id SF%06d.\n", found_id);
-	}
-
-	/* Try reading the devicestring. If that fails and the device is old (FW < 6.0.0, which we can not know)
-	 * then we need to try the "set voltage" command and then attempt to read the devicestring again. */
-	if (dediprog_check_devicestring(dp_data)) {
-		if (dediprog_set_voltage(dp_data->handle))
-			goto init_err_cleanup_exit;
-		if (dediprog_check_devicestring(dp_data))
-			goto init_err_cleanup_exit;
+		msg_pinfo("Using dediprog id %06d.\n", found_id);
 	}
 
 	/* SF100/SF200 uses one in/out endpoint, SF600 uses separate in/out endpoints */
