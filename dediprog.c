@@ -47,6 +47,7 @@ enum dediprog_devtype {
 	DEV_SF100		= 100,
 	DEV_SF200		= 200,
 	DEV_SF600		= 600,
+	DEV_SF600PG2		= 602,
 };
 
 enum dediprog_leds {
@@ -194,6 +195,8 @@ static enum protocol protocol(const struct dediprog_data *dp_data)
 			return PROTOCOL_V2;
 		else
 			return PROTOCOL_V3;
+	case DEV_SF600PG2:
+		return PROTOCOL_V3;
 	default:
 		return PROTOCOL_UNKNOWN;
 	}
@@ -350,7 +353,7 @@ static const struct dediprog_spispeeds spispeeds[] = {
 
 static int dediprog_set_spi_speed(unsigned int spispeed_idx, const struct dediprog_data *dp_data)
 {
-	if (dp_data->firmwareversion < FIRMWARE_VERSION(5, 0, 0)) {
+	if ((protocol(dp_data) < PROTOCOL_V2) && (dp_data->firmwareversion < FIRMWARE_VERSION(5, 0, 0))) {
 		msg_pwarn("Skipping to set SPI speed because firmware is too old.\n");
 		return 0;
 	}
@@ -808,24 +811,39 @@ static int dediprog_check_devicestring(struct dediprog_data *dp_data)
 		dp_data->devicetype = DEV_SF100;
 	else if (memcmp(buf, "SF200", 0x5) == 0)
 		dp_data->devicetype = DEV_SF200;
+	else if (memcmp(buf, "SF600PG2", 8) == 0)
+		dp_data->devicetype = DEV_SF600PG2;
 	else if (memcmp(buf, "SF600", 0x5) == 0)
 		dp_data->devicetype = DEV_SF600;
 	else {
-		msg_perr("Device not a SF100, SF200, or SF600!\n");
+		msg_perr("Device not a SF100, SF200, SF600, or SF600PG2!\n");
 		return 1;
 	}
 
-	int sfnum;
-	int fw[3];
-	if (sscanf(buf, "SF%d V:%d.%d.%d ", &sfnum, &fw[0], &fw[1], &fw[2]) != 4 ||
-	    sfnum != (int)dp_data->devicetype) {
-		msg_perr("Unexpected firmware version string '%s'\n", buf);
-		return 1;
+	int fw[3] = {0, 0, 0};
+	if (dp_data->devicetype == DEV_SF600PG2) {
+		if (sscanf(buf, "SF600PG2. V:%d.%d", &fw[0], &fw[1]) != 2) {
+			msg_perr("Unexpected firmware version string '%s'\n", buf);
+			return 1;
+		}
+		/* Only these major versions were tested. */
+		if (fw[0] < 1 || fw[0] > 1) {
+			msg_perr("Unexpected firmware version %d.%d.%d!\n", fw[0], fw[1], fw[2]);
+			return 1;
+		}
 	}
-	/* Only these major versions were tested. */
-	if (fw[0] < 2 || fw[0] > 7) {
-		msg_perr("Unexpected firmware version %d.%d.%d!\n", fw[0], fw[1], fw[2]);
-		return 1;
+	else {
+		int sfnum;
+		if (sscanf(buf, "SF%d V:%d.%d.%d ", &sfnum, &fw[0], &fw[1], &fw[2]) != 4 ||
+			sfnum != (int)dp_data->devicetype) {
+			msg_perr("Unexpected firmware version string '%s'\n", buf);
+			return 1;
+		}
+		/* Only these major versions were tested. */
+		if (fw[0] < 2 || fw[0] > 7) {
+			msg_perr("Unexpected firmware version %d.%d.%d!\n", fw[0], fw[1], fw[2]);
+			return 1;
+		}
 	}
 
 	dp_data->firmwareversion = FIRMWARE_VERSION(fw[0], fw[1], fw[2]);
@@ -894,7 +912,7 @@ static int dediprog_standalone_mode(const struct dediprog_data *dp_data)
 {
 	int ret;
 
-	if (dp_data->devicetype != DEV_SF600)
+	if ((dp_data->devicetype != DEV_SF600) && (dp_data->devicetype != DEV_SF600PG2))
 		return 0;
 
 	msg_pdbg2("Disabling standalone mode.\n");
@@ -1275,6 +1293,13 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 		break;
 	}
 
+	/* Exit standalone mode
+	 * Must do this prior to setting voltage and other config or it will
+	 * get reset by the device when exiting the mode.
+	 */
+	if (dediprog_standalone_mode(dp_data))
+		goto init_err_cleanup_exit;
+
 	/* Set all possible LEDs as soon as possible to indicate activity.
 	 * Because knowing the firmware version is required to set the LEDs correctly we need to this after
 	 * dediprog_check_devicestring() has queried the device. */
@@ -1288,11 +1313,8 @@ static int dediprog_init(const struct programmer_cfg *cfg)
 		goto init_err_cleanup_exit;
 	}
 
-	if (dediprog_standalone_mode(dp_data))
-		goto init_err_cleanup_exit;
-
 	if ((dp_data->devicetype == DEV_SF100) ||
-	    (dp_data->devicetype == DEV_SF600 && protocol(dp_data) == PROTOCOL_V3))
+	    (((dp_data->devicetype == DEV_SF600) || (dp_data->devicetype == DEV_SF600PG2)) && protocol(dp_data) == PROTOCOL_V3))
 		spi_master_dediprog.features &= ~SPI_MASTER_NO_4BA_MODES;
 
 	if (protocol(dp_data) >= PROTOCOL_V2)
