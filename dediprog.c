@@ -413,8 +413,11 @@ static int prepare_rw_cmd(
 			data_packet[4] = JEDEC_READ_4BA_FAST;
 		} else if (dedi_spi_cmd == WRITE_MODE_PAGE_PGM
 			   && (flash->chip->feature_bits & FEATURE_4BA_WRITE)) {
-			data_packet[3] = WRITE_MODE_4B_ADDR_256B_PAGE_PGM_0x12;
-			data_packet[4] = JEDEC_BYTE_PROGRAM_4BA;
+			//data_packet[3] = WRITE_MODE_4B_ADDR_256B_PAGE_PGM_0x12;
+			//data_packet[4] = JEDEC_BYTE_PROGRAM_4BA;
+			// SF600Plus-G2 can't handle the 0x12 page program command here, so use the "regular" one instead...
+			data_packet[3] = WRITE_MODE_4B_ADDR_256B_PAGE_PGM;
+			data_packet[4] = JEDEC_BYTE_PROGRAM;
 		}
 
 		*value = *idx = 0;
@@ -425,7 +428,13 @@ static int prepare_rw_cmd(
 		data_packet[9] = (start >> 24) & 0xff;
 		if (protocol(dp_data) >= PROTOCOL_V3) {
 			if (is_read) {
-				data_packet[10] = 0x00;	/* address length (3 or 4) */
+				if (flash->chip->feature_bits & FEATURE_4BA_FAST_READ) {
+					data_packet[10] = 4;	/* address length (3 or 4) */
+				}
+				else {
+					data_packet[10] = 0x00;	/* address length (3 or 4) */
+				}
+
 				data_packet[11] = 0x00;	/* dummy cycle / 2 */
 			} else {
 				/* 16 LSBs and 16 HSBs of page size */
@@ -434,6 +443,10 @@ static int prepare_rw_cmd(
 				data_packet[11] = 0x01;
 				data_packet[12] = 0x00;
 				data_packet[13] = 0x00;
+				data_packet[14] = 3; // Address Length. Will get set to 4 instead if we use a 4BA mode.
+				if (dedi_spi_cmd == WRITE_MODE_PAGE_PGM && (flash->chip->feature_bits & FEATURE_4BA_WRITE)) {
+					data_packet[14] = 4; // Address Length
+				}
 			}
 		}
 	} else {
@@ -651,7 +664,7 @@ static int dediprog_spi_bulk_write(struct flashctx *flash, const uint8_t *buf, u
 		command_packet_size = 10;
 		break;
 	case PROTOCOL_V3:
-		command_packet_size = 14;
+		command_packet_size = 15;
 		break;
 	default:
 		return 1;
@@ -716,10 +729,15 @@ static int dediprog_spi_write(struct flashctx *flash, const uint8_t *buf,
 
 	/* Round down. */
 	bulklen = (len - residue) / chunksize * chunksize;
-	ret = dediprog_spi_bulk_write(flash, buf + residue, chunksize, start + residue, bulklen, dedi_spi_cmd);
-	if (ret) {
-		dediprog_set_leds(LED_ERROR, dp_data);
-		return ret;
+	const unsigned block_size = 0x800000;
+	for (unsigned bulk_offset = 0; bulk_offset < bulklen; bulk_offset += block_size) {
+		unsigned bulk_chunksize = bulklen - bulk_offset;
+		if (bulk_chunksize > block_size) bulk_chunksize = block_size;
+		ret = dediprog_spi_bulk_write(flash, buf + residue +  bulk_offset, chunksize, start + residue + bulk_offset, bulk_chunksize, dedi_spi_cmd);
+		if (ret) {
+			dediprog_set_leds(LED_ERROR, dp_data);
+			return ret;
+		}
 	}
 
 	len -= residue + bulklen;
@@ -766,6 +784,17 @@ static int dediprog_spi_send_command(const struct flashctx *flash,
 		msg_perr("Invalid readcnt=%i, aborting.\n", readcnt);
 		return 1;
 	}
+	/*
+	if (writecnt > 0)
+	{
+		msg_pinfo("Writing cmd: ");
+		for (unsigned i = 0; i < writecnt; ++i)
+		{
+			msg_pinfo("%02x ", (int) writearr[i]);
+		}
+		msg_pinfo("\n");
+	}
+	*/
 
 	unsigned int idx, value;
 	/* New protocol has options and timeout combined as value while the old one used the value field for
