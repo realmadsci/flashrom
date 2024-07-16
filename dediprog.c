@@ -240,16 +240,34 @@ static int dediprog_read(libusb_device_handle *dediprog_handle,
 			 enum dediprog_cmds cmd, unsigned int value, unsigned int idx,
 			 uint8_t *bytes, size_t size)
 {
-	return libusb_control_transfer(dediprog_handle, REQTYPE_EP_IN, cmd, value, idx,
+	// This is needed to avoid some race condition between the write (and either more write or a read) that
+	// causes a USB transfer timeout - it seems like the Dediprog falls behind somehow.
+	internal_sleep(1000);
+
+	int ret = libusb_control_transfer(dediprog_handle, REQTYPE_EP_IN, cmd, value, idx,
 				      (unsigned char *)bytes, size, DEFAULT_TIMEOUT);
+
+	// This is needed to avoid some race condition between the write (and either more write or a read) that
+	// causes a USB transfer timeout - it seems like the Dediprog falls behind somehow.
+	internal_sleep(1000);
+	return ret;
 }
 
 static int dediprog_write(libusb_device_handle *dediprog_handle,
 			  enum dediprog_cmds cmd, unsigned int value, unsigned int idx,
 			  const uint8_t *bytes, size_t size)
 {
-	return libusb_control_transfer(dediprog_handle, REQTYPE_EP_OUT, cmd, value, idx,
+	// This is needed to avoid some race condition between the write (and either more write or a read) that
+	// causes a USB transfer timeout - it seems like the Dediprog falls behind somehow.
+	internal_sleep(1000);
+
+	int ret = libusb_control_transfer(dediprog_handle, REQTYPE_EP_OUT, cmd, value, idx,
 				      (unsigned char *)bytes, size, DEFAULT_TIMEOUT);
+
+	// This is needed to avoid some race condition between the write (and either more write or a read) that
+	// causes a USB transfer timeout - it seems like the Dediprog falls behind somehow.
+	internal_sleep(1000);
+	return ret;
 }
 
 
